@@ -1,0 +1,5 @@
+.env
+ssh/
+uploads/
+*.log
+.DS_Store

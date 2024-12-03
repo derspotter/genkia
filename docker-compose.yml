@@ -1,0 +1,24 @@
+services:
+  nodejs-app:
+    build: .
+    volumes:
+      - ./uploads:/app/uploads
+      - ./ssh:/app/ssh:ro
+      - ./server.js:/app/server.js
+    env_file:
+      - .env
+    networks:
+      - caddy
+      - default
+
+  mongodb:
+    image: mongo:7
+    volumes:
+      - mongodb_data:/data/db
+
+volumes:
+  mongodb_data:
+
+networks:
+  caddy:
+    external: true
