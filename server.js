@@ -7,13 +7,10 @@ const { exec } = require('child_process');
 const mongoose = require('mongoose');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
-const fs = require('fs');
-const bodyParser = require('body-parser');
-const app = express();
+const fs = require('fs').promises;
+const { createWriteStream, statSync } = require('fs');
 
-// For text fields
-app.use(bodyParser.json({ limit: '1mb' })); // Only need small limit for JSON
-app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
+const app = express();
 
 // Security middleware
 app.use(helmet());
@@ -155,179 +152,231 @@ app.get('/api/verify/:token', async (req, res) => {
   }
 });
 
-const upload = multer({ 
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, '/app/uploads/');
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + crypto.randomBytes(8).toString('hex');
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-    }
-}),
-limits: { 
-    fileSize: 500 * 1024 * 1024, // 500MB in bytes
-    fieldSize: 500 * 1024 * 1024,
-    fields: 5,   // Limit number of non-file fields
-    parts: 6     // Total fields + files
-},
-  fileFilter: (req, file, cb) => {
-    console.log('Received file:', file);
-    const filetypes = /mp3|wav|m4a|ogg|flac|aac|opus/;
-    const mimetypes = /audio\/(mp3|wav|x-wav|m4a|x-m4a|ogg|flac|aac|mpeg|mp4)|video\/(ogg|mp4)/;
-    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = mimetypes.test(file.mimetype);
-    
-    console.log('Mimetype check:', mimetype);
-    console.log('Extension check:', extname);
-    console.log('File mimetype:', file.mimetype);
-    console.log('File extension:', path.extname(file.originalname).toLowerCase());
-    
-    if (mimetype && extname) {
-      return cb(null, true);
-    }
-    cb(new Error(`Error: Only audio files are allowed (mp3, wav, m4a, ogg, flac, aac). Received mimetype: ${file.mimetype}, extension: ${path.extname(file.originalname)}`));
-    
-  }
-}).single('file');
-
 const { spawn } = require('child_process');
 
-app.post('/api/upload', async (req, res) => {
-    console.log('Upload request received');
-    
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
+// Temporary storage for chunks
+const uploadChunks = new Map();
 
-    const sendSSE = (type, data) => {
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
-      }
-    };
+const SPEED_WINDOW = 3; // Number of chunks to average speed over
 
-    try {
-      await new Promise((resolve, reject) => {
-        let uploadedBytes = 0;
-        let lastProgress = 0;
+app.post('/api/upload-chunk', express.raw({ limit: '10mb' }), (req, res) => {
+  const fileName = req.headers['x-file-name'];
+  const fileExtension = path.extname(fileName).toLowerCase();
+  const email = req.headers['x-email'];
+  const chunkNumber = parseInt(req.headers['x-chunk-number']);
+  const totalChunks = parseInt(req.headers['x-total-chunks']);
+  const buffer = req.body;
+  const fileId = req.headers['x-file-id'];
 
-        req.on('data', (chunk) => {
-          console.log('Chunk size:', chunk.length, 'bytes');
-          // Keep track of our last sent progress percentage
-          let lastProgress = req.uploadProgress || 0;
-          // Add the new chunk to our total
-          uploadedBytes += chunk.length;
-          // Calculate current progress percentage
-          const currentProgress = Math.round((uploadedBytes / req.headers['content-length']) * 100);
-          // Only send an update if we've moved to a new percentage point
-          if (currentProgress > lastProgress) {
-            sendSSE('upload_progress', { progress: currentProgress });
-            // Store the last progress we sent on the request object
-            req.uploadProgress = currentProgress;
-          }
-        });
+  console.log(`\n=== Processing chunk ${chunkNumber + 1}/${totalChunks} ===`);
+  console.log(`File: ${fileName}`);
+  console.log(`Size: ${(buffer.length / 1024 / 1024).toFixed(2)} MB`);
 
-        upload(req, res, (err) => {
-          if (err) {
-            sendSSE('error', { message: err.message });
-            reject(err);
-            return;
-          }
-          resolve();
-        });
+  try {
+    if (!uploadChunks.has(fileId)) {
+      uploadChunks.set(fileId, {
+        chunks: new Map(),
+        startTime: Date.now(),
+        totalBytes: 0,
+        fileName,
+        chunkTimes: new Map() // Track timing of recent chunks
       });
-
-
-      if (!req.file) {
-        throw new Error('No file uploaded');
-      }
-
-      console.log('File uploaded successfully:', req.file.filename);
-
-    const { email } = req.body;
-    // Email validation commented out as per your code
-    // if (!email || !email.endsWith('@wzb.eu')) {
-    //   throw new Error('Invalid email address');
-    // }
-
-    const verifiedUser = await VerifiedUser.findOne({ email });
-    if (!verifiedUser) {
-      throw new Error('Email not verified. Please verify your email before uploading.');
     }
 
-    console.log('User verified, proceeding with file processing');
-
-    const jobId = crypto.randomBytes(16).toString('hex');
-    console.log('Generated job ID:', jobId);
-
-    const metadataPath = `/app/uploads/${jobId}.json`;
-    const metadata = { jobId, email, audioFilename: req.file.filename, originalFilename: req.file.originalname };
-    await fs.promises.writeFile(metadataPath, JSON.stringify(metadata));
-    console.log('Metadata file created:', metadataPath);
-
-    const rsyncArgs = [
-      '-avz',
-      '--progress',
-      '-e', `ssh -o StrictHostKeyChecking=accept-new -i /app/ssh/kkey -p ${process.env.SSH_PORT || '22'}`,
-      `/app/uploads/${req.file.filename}`,
-      metadataPath,
-      `jay@${process.env.SSH_HOST}:transcribe/audio/`
-    ];
+    const upload = uploadChunks.get(fileId);
+    const now = Date.now();
     
-    console.log('Executing rsync command:', rsyncArgs.join(' '));
+    upload.chunks.set(chunkNumber, buffer);
+    upload.totalBytes += buffer.length;
+    upload.chunkTimes.set(chunkNumber, now);
+
+    // Calculate speed using recent chunks
+    const startChunk = Math.max(0, chunkNumber - SPEED_WINDOW + 1);
+    const recentTime = now - (upload.chunkTimes.get(startChunk) || upload.startTime);
+    const recentBytes = Array.from(upload.chunks.entries())
+      .filter(([num]) => num >= startChunk && num <= chunkNumber)
+      .reduce((sum, [_, chunk]) => sum + chunk.length, 0);
     
-    const rsync = spawn('rsync', rsyncArgs);
+    const speed = recentTime > 0 ? (recentBytes / 1024 / 1024) / (recentTime / 1000) : 0;
+    const progress = Math.round((upload.chunks.size / totalChunks) * 100);
 
-    rsync.stdout.on('data', (data) => {
-      const output = data.toString();
-      const match = output.match(/(\d+)%/);
-      if (match) {
-        const progress = parseInt(match[1], 10);
-        sendSSE('rsync_progress', { progress });
-      }
-    });
+    console.log(`Progress: ${progress}%`);
+    console.log(`Speed: ${speed.toFixed(2)} MB/s`);
 
-    rsync.stderr.on('data', (data) => {
-      console.error(`rsync stderr: ${data}`);
-    });
-
-    await new Promise((resolve, reject) => {
-      rsync.on('close', async (code) => {
-        console.log(`rsync process exited with code ${code}`);
-
-        if (code === 0) {
-          console.log('rsync completed successfully');
-
-          try {
-            await Promise.all([
-              fs.promises.unlink(req.file.path),
-              fs.promises.unlink(metadataPath)
-            ]);
-            console.log('Temporary files deleted successfully');
-          } catch (cleanupError) {
-            console.error(`Cleanup error:`, cleanupError);
-          }
-
-          sendSSE('rsync_complete', { jobId });
-          resolve();
-        } else {
-          console.error('rsync failed');
-          reject(new Error('Error transferring file to home PC'));
+    if (progress === 100) {
+      console.log('Upload complete, starting processing...');
+      setImmediate(async () => {
+        try {
+          await combineAndProcessFile(fileId, email);
+          console.log(`Processing completed for file ${fileName}`);
+        } catch (error) {
+          console.error('Processing error:', error);
         }
       });
-    });
-
-    } catch (error) {
-      console.error('Upload error details:', {
-        message: error.message,
-        stack: error.stack,
-        name: error.name
-      });
-      sendSSE('error', { message: error.message });
     }
+
+    res.json({ progress, speed: speed.toFixed(2), chunk: chunkNumber, total: totalChunks });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
+
+async function combineAndProcessFile(fileId, email, progressCallback) {
+  // ... existing setup code ...
+
+  try {
+      progressCallback('Writing file', 0);
+      const writeStream = createWriteStream(finalPath);
+      let bytesWritten = 0;
+      const totalBytes = upload.chunks.size * upload.chunks.get(0).length;
+
+      for (let i = 0; i < upload.totalChunks; i++) {
+          const chunk = upload.chunks.get(i);
+          if (!chunk) throw new Error(`Missing chunk ${i}`);
+          
+          await new Promise((resolve, reject) => {
+              writeStream.write(chunk, (error) => {
+                  if (error) reject(error);
+                  else {
+                      bytesWritten += chunk.length;
+                      progressCallback('Writing file', 
+                          Math.round((bytesWritten / totalBytes) * 100));
+                      resolve();
+                  }
+              });
+          });
+      }
+
+      progressCallback('Starting rsync', 50);
+
+      // Initialize rsync with progress tracking
+      const rsync = spawn('rsync', [
+          '-avz',
+          '--progress',
+          '-e', `ssh -o StrictHostKeyChecking=accept-new -i /app/ssh/kkey -p ${process.env.SSH_PORT || '22'}`,
+          finalPath,
+          metadataPath,
+          `jay@${process.env.SSH_HOST}:transcribe/audio/`
+      ]);
+
+      rsync.stdout.on('data', (data) => {
+          const output = data.toString();
+          if (output.includes('%')) {
+              const match = output.match(/(\d+)%/);
+              if (match) {
+                  const rsyncProgress = parseInt(match[1]);
+                  progressCallback('Transferring', rsyncProgress);
+              }
+          }
+          console.log('rsync:', output.trim());
+      });
+
+      // ... rest of the rsync code ...
+  } catch (error) {
+      console.error('Error in processing:', error);
+      throw error;
+  }
+}
+
+async function combineAndProcessFile(fileId, email) {
+  const upload = uploadChunks.get(fileId);
+  const uniqueSuffix = Date.now() + '-' + crypto.randomBytes(8).toString('hex');
+  const finalPath = path.join('/app/uploads', `${fileId}-${upload.fileName}`);
+  let rsyncSuccess = false;
+
+  try {
+      // Write file
+      const writeStream = createWriteStream(finalPath);
+      
+      for (let i = 0; i < upload.totalChunks; i++) {
+          const chunk = upload.chunks.get(i);
+          if (!chunk) throw new Error(`Missing chunk ${i}`);
+          await new Promise((resolve, reject) => {
+              writeStream.write(chunk, (error) => {
+                  if (error) reject(error);
+                  else resolve();
+              });
+          });
+      }
+
+      await new Promise((resolve, reject) => {
+          writeStream.end((error) => {
+              if (error) reject(error);
+              else resolve();
+          });
+      });
+
+      console.log('File written successfully to:', finalPath);
+      
+      // Clean up chunks early to free memory
+      uploadChunks.delete(fileId);
+
+      // Create and write metadata
+      const jobId = crypto.randomBytes(16).toString('hex');
+      const metadataPath = `/app/uploads/${jobId}.json`;
+      const metadata = {
+          jobId,
+          email,
+          audioFilename: path.basename(finalPath),
+          originalFilename: upload.fileName,
+          fileSize: statSync(finalPath).size,
+          uploadTime: new Date().toISOString()
+      };
+
+      await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+      console.log('Metadata written to:', metadataPath);
+
+      // Try rsync
+      console.log('Starting rsync transfer...');
+      await new Promise((resolve, reject) => {
+          const rsync = spawn('rsync', [
+              '-avz',
+              '--progress',
+              '-e', `ssh -o StrictHostKeyChecking=accept-new -i /app/ssh/kkey -p ${process.env.SSH_PORT || '22'}`,
+              finalPath,
+              metadataPath,
+              `jay@${process.env.SSH_HOST}:transcribe/audio/`
+          ]);
+
+          rsync.stdout.on('data', (data) => {
+              console.log('rsync stdout:', data.toString());
+          });
+
+          rsync.stderr.on('data', (data) => {
+              console.error('rsync stderr:', data.toString());
+          });
+
+          rsync.on('close', (code) => {
+              if (code === 0) {
+                  rsyncSuccess = true;
+                  resolve();
+              } else {
+                  reject(new Error(`rsync failed with code ${code}`));
+              }
+          });
+      });
+
+      // Only delete local files if rsync succeeded
+      if (rsyncSuccess) {
+          await Promise.all([
+              fs.unlink(finalPath),
+              fs.unlink(metadataPath)
+          ]);
+          console.log('Local files cleaned up after successful transfer');
+      } else {
+          console.log('Keeping local files due to transfer failure');
+      }
+
+  } catch (error) {
+      console.error('Error in processing:', error);
+      // Don't delete files if rsync failed - they might be needed for retry
+      if (!rsyncSuccess) {
+          console.log('Keeping files for potential retry');
+      }
+      throw error; // Rethrow for background handling
+  }
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
